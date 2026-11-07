@@ -1,153 +1,223 @@
-/*
-  Superglue (CA) Fuming Chamber Controller
-  ESP32 + 2-channel relay (heater, fan) + DHT22 (temp/humidity)
-
-  State machine:
-    IDLE  -> HEATING -> HOLDING -> PURGING -> IDLE
-
-  Safety:
-    - Hard over-temp cutoff kills heater regardless of state
-    - Heater relay is only ever allowed ON if fan relay is also ON (interlock)
-    - Fan runs during purge even after an over-temp fault, until temp drops
-*/
-
-#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <DHT.h>
 
-// ---------- Pin config ----------
-#define DHTPIN        4
-#define DHTTYPE       DHT22
-#define RELAY_HEATER  26
-#define RELAY_FAN     27
-#define RELAY_ACTIVE_LOW true   // most relay modules are active-low; flip if needed
+// --- SCREEN CONFIGURATION ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ---------- Setpoints ----------
-const float TARGET_TEMP_C   = 45.0;   // fuming temp
-const float TARGET_HUMIDITY = 75.0;   // % RH, informational / can gate cycle start
-const float TEMP_HYSTERESIS = 1.5;    // bang-bang deadband
-const float OVERTEMP_CUTOFF = 62.0;   // hard safety limit, independent of state
-const unsigned long HOLD_DURATION_MS  = 10UL * 60UL * 1000UL; // 10 min fuming hold
-const unsigned long PURGE_DURATION_MS = 5UL  * 60UL * 1000UL; // 5 min purge
+// --- PIN DEFINITIONS ---
+#define PIN_XYT01_TEMP  34  // Analog pin reading XY-T01 output / NTC probe
+#define PIN_DHT         4   // DHT11 sensor pin
+#define PIN_RELAY_HEAT  16  // Vaporizer heater relay
+#define PIN_RELAY_FAN   17  // Fan relay
+#define PIN_RELAY_HUM   18  // Humidifier relay
+#define PIN_BUTTON_START 19 // Push button to start process
 
-DHT dht(DHTPIN, DHTTYPE);
+// --- SENSOR CONFIGURATION ---
+#define DHTTYPE DHT11
+DHT dht(PIN_DHT, DHTTYPE);
 
-enum State { IDLE, HEATING, HOLDING, PURGING, FAULT };
-State state = IDLE;
-unsigned long stateEnteredAt = 0;
+// --- PROCESS SETPOINTS & PARAMETERS ---
+const float TEMP_SETPOINT_C = 9.0;
+const float TEMP_HYSTERESIS = 2.0;
 
-bool overTempFault = false;
+const float HUM_SETPOINT_RH = 70.0;
+const float HUM_HYSTERESIS = 3.0;
 
-void logStatus(float t, float h, bool sensorOk);
+const unsigned long FUME_DURATION_SEC = 300; // Fuming cycle duration: 5 minutes
+const unsigned long PURGE_DURATION_SEC = 180; // Post-fuming ventilation: 3 minutes
 
-void setRelay(int pin, bool on) {
-  bool level = RELAY_ACTIVE_LOW ? !on : on;
-  digitalWrite(pin, level ? HIGH : LOW);
+// --- SYSTEM STATES ---
+enum SystemState {
+  STATE_IDLE,
+  STATE_FUMING,
+  STATE_PURGING,
+  STATE_COMPLETE
+};
+
+SystemState currentState = STATE_IDLE;
+unsigned long stateStartTime = 0;
+bool lastButtonState = HIGH;
+
+// --- SENSOR READINGS ---
+float chamberTempXY = 0.0;
+float chamberTempDHT = 0.0;
+float chamberHumidity = 0.0;
+
+// Function prototype for reading XY-T01 analog input
+float readXYT01Temperature() {
+  int rawADC = analogRead(PIN_XYT01_TEMP);
+  // Conversion formula mapped for 0-3.3V ADC corresponding to 0-100°C output scale
+  float tempC = (rawADC / 4095.0) * 100.0; 
+  return tempC;
 }
 
-void enterState(State s) {
-  state = s;
-  stateEnteredAt = millis();
-  Serial.print("-> State: ");
-  Serial.println(s);
+
+void updateDisplay(unsigned long elapsedSec) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+
+  // Line 1: Header / State
+  display.print(F("MODE: "));
+  switch (currentState) {
+    case STATE_IDLE:     display.println(F("IDLE (Press Go)")); break;
+    case STATE_FUMING:   display.println(F("FUMING...")); break;
+    case STATE_PURGING:  display.println(F("PURGING FUMES")); break;
+    case STATE_COMPLETE: display.println(F("DONE / SAFE")); break;
+  }
+  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+  // Line 2 & 3: Temperatures & Humidity
+  display.setCursor(0, 16);
+  display.print(F("Vap Temp: "));
+  display.print(chamberTempXY, 1);
+  display.println(F(" C"));
+
+  display.setCursor(0, 28);
+  display.print(F("Humidity: "));
+  display.print(chamberHumidity, 1);
+  display.println(F(" %RH"));
+
+  // Line 4: Timer Remaining
+  display.setCursor(0, 42);
+  display.print(F("Time Rem: "));
+  
+  if (currentState == STATE_FUMING) {
+    long rem = FUME_DURATION_SEC - elapsedSec;
+    if (rem < 0) rem = 0;
+    display.print(rem / 60); display.print(F("m "));
+    display.print(rem % 60); display.print(F("s"));
+  } else if (currentState == STATE_PURGING) {
+    long rem = PURGE_DURATION_SEC - elapsedSec;
+    if (rem < 0) rem = 0;
+    display.print(rem / 60); display.print(F("m "));
+    display.print(rem % 60); display.print(F("s"));
+  } else {
+    display.print(F("--:--"));
+  }
+
+  // Line 5: Relay status indicators
+  display.setCursor(0, 54);
+  display.print(F("H:")); display.print(digitalRead(PIN_RELAY_HEAT) ? F("ON ") : F("OFF"));
+  display.print(F(" F:")); display.print(digitalRead(PIN_RELAY_FAN) ? F("ON ") : F("OFF"));
+  display.print(F(" M:")); display.print(digitalRead(PIN_RELAY_HUM) ? F("ON") : F("OFF"));
+
+  display.display();
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(RELAY_HEATER, OUTPUT);
-  pinMode(RELAY_FAN, OUTPUT);
-  setRelay(RELAY_HEATER, false);
-  setRelay(RELAY_FAN, false);
+
+  // Initialize Relays (Active HIGH standard; set LOW to ensure OFF initially)
+  pinMode(PIN_RELAY_HEAT, OUTPUT);
+  pinMode(PIN_RELAY_FAN, OUTPUT);
+  pinMode(PIN_RELAY_HUM, OUTPUT);
+  digitalWrite(PIN_RELAY_HEAT, LOW);
+  digitalWrite(PIN_RELAY_FAN, LOW);
+  digitalWrite(PIN_RELAY_HUM, LOW);
+
+  // Initialize Button
+  pinMode(PIN_BUTTON_START, INPUT_PULLUP);
+
+  // Initialize Sensors & Display
   dht.begin();
-  Serial.println("Fuming chamber controller ready. Send 'start' or 'stop' over Serial.");
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(15, 25);
+  display.println(F("Cyano Fumer v1.0"));
+  display.display();
+  delay(1500);
 }
 
 void loop() {
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
-  bool sensorOk = !isnan(t) && !isnan(h);
+  // 1. Read Sensors
+  chamberTempXY = readXYT01Temperature();
+  chamberTempDHT = dht.readTemperature();
+  chamberHumidity = dht.readHumidity();
 
-  // ---- Serial commands ----
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd == "start" && state == IDLE) enterState(HEATING);
-    else if (cmd == "stop") { overTempFault = false; enterState(PURGING); }
-  }
+  // Handle DHT failure fallback
+  if (isnan(chamberHumidity)) chamberHumidity = 0.0;
 
-  // ---- Hard safety cutoff, checked every loop regardless of state ----
-  if (sensorOk && t >= OVERTEMP_CUTOFF) {
-    overTempFault = true;
-  }
-
-  if (overTempFault) {
-    setRelay(RELAY_HEATER, false);  // heater always off on fault
-    setRelay(RELAY_FAN, true);      // fan stays on to cool/vent
-    if (state != FAULT) enterState(FAULT);
-    if (sensorOk && t < (OVERTEMP_CUTOFF - 5.0)) {
-      // cooled down enough, drop into purge instead of staying latched forever
-      overTempFault = false;
-      enterState(PURGING);
+  // 2. Read Control Button (Debounced basic trigger)
+  bool currentBtnState = digitalRead(PIN_BUTTON_START);
+  if (lastButtonState == HIGH && currentBtnState == LOW) {
+    if (currentState == STATE_IDLE || currentState == STATE_COMPLETE) {
+      currentState = STATE_FUMING;
+      stateStartTime = millis();
+    } else if (currentState == STATE_FUMING) {
+      // Manual abort -> jump to purge state for safety
+      currentState = STATE_PURGING;
+      stateStartTime = millis();
     }
-    logStatus(t, h, sensorOk);
-    delay(1000);
-    return;
   }
+  lastButtonState = currentBtnState;
 
-  // ---- Heater/fan interlock: heater only allowed if fan is on ----
-  bool fanOn = false;
-  bool heaterRequest = false;
+  // 3. Process State Machine & Relay Control Logic
+  unsigned long elapsedSec = (millis() - stateStartTime) / 1000;
 
-  switch (state) {
-    case IDLE:
-      fanOn = false;
-      heaterRequest = false;
+  switch (currentState) {
+    case STATE_IDLE:
+      digitalWrite(PIN_RELAY_HEAT, LOW);
+      digitalWrite(PIN_RELAY_FAN, LOW);
+      digitalWrite(PIN_RELAY_HUM, LOW);
       break;
 
-    case HEATING:
-      fanOn = true;
-      if (sensorOk) {
-        heaterRequest = t < TARGET_TEMP_C;
-        if (t >= TARGET_TEMP_C) enterState(HOLDING);
+    case STATE_FUMING:
+      // Vaporizer Temperature Bang-Bang Control
+      if (chamberTempXY < (TEMP_SETPOINT_C - TEMP_HYSTERESIS)) {
+        digitalWrite(PIN_RELAY_HEAT, HIGH);
+      } else if (chamberTempXY >= TEMP_SETPOINT_C) {
+        digitalWrite(PIN_RELAY_HEAT, LOW);
+      }
+
+      // Humidifier Control
+      if (chamberHumidity < (HUM_SETPOINT_RH - HUM_HYSTERESIS)) {
+        digitalWrite(PIN_RELAY_HUM, HIGH);
+      } else if (chamberHumidity >= HUM_SETPOINT_RH) {
+        digitalWrite(PIN_RELAY_HUM, LOW);
+      }
+
+      // Fan running low/intermittent during fuming for distribution
+      digitalWrite(PIN_RELAY_FAN, HIGH);
+
+      // Check transition to Purge
+      if (elapsedSec >= FUME_DURATION_SEC) {
+        currentState = STATE_PURGING;
+        stateStartTime = millis();
       }
       break;
 
-    case HOLDING:
-      fanOn = true;
-      if (sensorOk) {
-        // simple bang-bang around target
-        if (t < TARGET_TEMP_C - TEMP_HYSTERESIS) heaterRequest = true;
-        else if (t > TARGET_TEMP_C + TEMP_HYSTERESIS) heaterRequest = false;
-        else heaterRequest = (t < TARGET_TEMP_C);
+    case STATE_PURGING:
+      // Turn off heater and humidifier; run fan to clear fumes
+      digitalWrite(PIN_RELAY_HEAT, LOW);
+      digitalWrite(PIN_RELAY_HUM, LOW);
+      digitalWrite(PIN_RELAY_FAN, HIGH);
+
+      if (elapsedSec >= PURGE_DURATION_SEC) {
+        currentState = STATE_COMPLETE;
       }
-      if (millis() - stateEnteredAt >= HOLD_DURATION_MS) enterState(PURGING);
       break;
 
-    case PURGING:
-      fanOn = true;
-      heaterRequest = false;
-      if (millis() - stateEnteredAt >= PURGE_DURATION_MS) enterState(IDLE);
-      break;
-
-    case FAULT:
-      // handled above
+    case STATE_COMPLETE:
+      digitalWrite(PIN_RELAY_HEAT, LOW);
+      digitalWrite(PIN_RELAY_FAN, LOW);
+      digitalWrite(PIN_RELAY_HUM, LOW);
       break;
   }
 
-  setRelay(RELAY_FAN, fanOn);
-  setRelay(RELAY_HEATER, fanOn && heaterRequest); // interlock enforced here
+  // 4. Update OLED Display
+  updateDisplay(elapsedSec);
 
-  logStatus(t, h, sensorOk);
-  delay(1000);
-}
-
-void logStatus(float t, float h, bool sensorOk) {
-  Serial.print("State="); Serial.print(state);
-  if (sensorOk) {
-    Serial.print(" T="); Serial.print(t);
-    Serial.print("C H="); Serial.print(h);
-    Serial.print("%");
-  } else {
-    Serial.print(" SENSOR READ FAILED");
-  }
-  Serial.println();
+  delay(200); // Main loop timing delay
 }
