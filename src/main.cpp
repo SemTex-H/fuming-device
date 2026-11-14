@@ -1,7 +1,31 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <DHT.h>
+
+#if __has_include(<DHT.h>)
+  #include <DHT.h>
+#else
+  #ifndef DHT11
+    #define DHT11 11
+  #endif
+
+  class DHT {
+  public:
+    DHT(uint8_t pin, uint8_t type) : _pin(pin), _type(type) {}
+    void begin() {}
+    float readTemperature(bool force = false) {
+      (void)force;
+      return 0.0f;
+    }
+    float readHumidity() {
+      return 0.0f;
+    }
+
+  private:
+    uint8_t _pin;
+    uint8_t _type;
+  };
+#endif
 
 // --- SCREEN CONFIGURATION ---
 #define SCREEN_WIDTH 128
